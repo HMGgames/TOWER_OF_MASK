@@ -1385,11 +1385,11 @@ function setTouchInputFromScreen(sx, sy){
   else touchInput.right = true;
 }
 
-function mousePressed(){
+function handlePrimaryPress(sx, sy){
   ensureAudioReady();
   if (isOverlayOpen()) return;
 
-  const w = screenToWorld(mouseX, mouseY);
+  const w = screenToWorld(sx, sy);
 
   if (gameState === STATE.START){
     const bw = START_BTN.bw, bh = START_BTN.bh;
@@ -1410,7 +1410,7 @@ function mousePressed(){
       tutorialSeenThisSession = true;
       clearTouchInput();
     } else {
-      setTouchInputFromScreen(mouseX, mouseY);
+      setTouchInputFromScreen(sx, sy);
     }
     return;
   }
@@ -1430,6 +1430,10 @@ function mousePressed(){
   }
 }
 
+function mousePressed(){
+  handlePrimaryPress(mouseX, mouseY);
+}
+
 function mouseDragged(){
   setTouchInputFromScreen(mouseX, mouseY);
   return false;
@@ -1440,14 +1444,22 @@ function mouseReleased(){
   return false;
 }
 
+function getTouchPoint(){
+  if (touches && touches.length > 0){
+    return { x: touches[0].x, y: touches[0].y };
+  }
+  return { x: mouseX, y: mouseY };
+}
+
 function touchStarted(){
-  ensureAudioReady();
-  if (!isOverlayOpen()) setTouchInputFromScreen(mouseX, mouseY);
+  const p = getTouchPoint();
+  handlePrimaryPress(p.x, p.y);
   return false;
 }
 
 function touchMoved(){
-  setTouchInputFromScreen(mouseX, mouseY);
+  const p = getTouchPoint();
+  setTouchInputFromScreen(p.x, p.y);
   return false;
 }
 
