@@ -1,11 +1,11 @@
 /*  TOWER OF MASKS — Donkey-style Vertical (p5.js)
     WORLD 1080x1920, fit-to-screen (no stretch)
 
-    Final fixes in this version:
+    ✅ 3 LEVELS: you must clear 3 princesses to reach leaderboard
+    ✅ Money accumulates across levels (no reset between level 1/2/3)
+    ✅ Each level regenerates ladders layout randomly (but never "two ladders together")
+    ✅ Difficulty increases by ladder progress AND by level
     ✅ Start button: HUGE hitbox box, image drawn FIT (NO stretch, NO shadow)
-    ✅ Ladders: generation guarantees no “two ladders together” (avoids climb lock)
-    ✅ Princess: always spawns away from villain on top (safer win contact)
-    ✅ Projectiles: planned random drop positions across platform segments (edges included)
 */
 
 const ASSET_DIR = "assets/";
@@ -15,7 +15,7 @@ const GOOGLE_ENDPOINT =
 const WORLD_W = 1080;
 const WORLD_H = 1920;
 
-const STATE = { START:"START", PLAY:"PLAY", WIN:"WIN", LOSE:"LOSE" };
+const STATE = { START:"START", PLAY:"PLAY", LEVEL_CLEAR:"LEVEL_CLEAR", WIN:"WIN", LOSE:"LOSE" };
 let gameState = STATE.START;
 
 // Assets
@@ -30,6 +30,11 @@ let platforms = [];
 let ladders = [];
 let player, villain, princess;
 let projectiles = [];
+
+// LEVELS
+const MAX_LEVELS = 3;
+let level = 1;              // 1..3
+let levelSeed = 0;
 
 // Money
 const START_MONEY = 322000;
@@ -114,6 +119,14 @@ const TUTORIAL_UI = {
   lineGap: 44,
 };
 
+// Level clear UI
+const LEVEL_CLEAR_UI = {
+  cardW: 920,
+  cardH: 320,
+  titleSize: 54,
+  bodySize: 26,
+};
+
 function assetPath(fn){ return encodeURI(ASSET_DIR + fn); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
 
@@ -151,7 +164,7 @@ function preload(){
   img.projBomb   = loadImage(assetPath("proj_bomb.png"));
   img.projCoin   = loadImage(assetPath("proj_coin.png"));
 
-  // Sounds
+  // Sounds (.wav)
   snd.MAIN_MENU       = loadSound(assetPath("MAIN_MENU.wav"));
   snd.GameLoop        = loadSound(assetPath("GameLoop.wav"));
   snd.Victory         = loadSound(assetPath("Victory.wav"));
@@ -180,8 +193,8 @@ function setup(){
   initAudioUI();
 
   initNameOverlay();
-  buildLevelLayout(Date.now()); // seeded ladder layout (prevents “double ladders”)
-  resetRun();
+
+  resetRun(); // will create level 1 + layout seed
 
   setTimeout(()=>fetchGlobalTop10JSONP(true), 400);
 }
@@ -344,6 +357,80 @@ function loadVolumePrefs(){
 }
 
 // ----------------------------------------------------
+// RUN / LEVEL FLOW
+// ----------------------------------------------------
+function resetRun(){
+  money = START_MONEY;
+  level = 1;
+  submittedThisRun = false;
+  pendingSubmit = false;
+  closeNameOverlay();
+
+  stopMusic("Victory"); stopMusic("Defeat");
+  endMusicNow = null;
+
+  startLevel(level, Date.now());
+}
+
+// Start/restart a level WITHOUT resetting money (money accumulates)
+function startLevel(lv, seed){
+  level = clamp(lv, 1, MAX_LEVELS);
+  levelSeed = seed || Date.now();
+
+  buildLevelLayout(levelSeed);
+
+  bestPlatformReached = 0;
+  projectiles = [];
+  villainThrowTimer = 0;
+  lastMs = millis();
+
+  const base = platforms[0];
+  const top  = platforms[platforms.length-1];
+
+  player = {
+    x: WORLD_W*0.18,
+    footY: base.floorY,
+    w:60, h:90,
+    vx:0, vy:0,
+    speed:340,
+    gravity:1600,
+    onGround:true,
+    onLadder:false,
+    ladderId:-1,
+    facing:1,
+    anim:"idle",
+  };
+
+  villain = {
+    x: WORLD_W*0.38,       // a bit left, farther from princess
+    footY: top.floorY,
+    w:120, h:150,
+    throwing:false,
+    throwPoseT:0,
+    goodFlashT:0,
+    lastThrowWasGood:false,
+  };
+
+  // princess: near top ladder BUT away from villain
+  const topLadder = ladders[ladders.length - 1];
+
+  const MIN_VILLAIN_DIST = 300; // slightly stronger separation
+  const leftPos  = clamp(topLadder.x - 44, 120, WORLD_W - 140);
+  const rightPos = clamp(topLadder.x + topLadder.w + 44, 120, WORLD_W - 140);
+
+  let princessX = (Math.abs(rightPos - villain.x) >= Math.abs(leftPos - villain.x)) ? rightPos : leftPos;
+  if (Math.abs(princessX - villain.x) < MIN_VILLAIN_DIST){
+    princessX = (princessX === rightPos) ? leftPos : rightPos;
+  }
+
+  princess = {
+    x: princessX,
+    footY: top.floorY,
+    w:80, h:120,
+  };
+}
+
+// ----------------------------------------------------
 // LEVEL LAYOUT (NO double ladders)
 // ----------------------------------------------------
 function buildLevelLayout(seed){
@@ -367,7 +454,6 @@ function buildLevelLayout(seed){
 
   const ladderW = 72;
 
-  // Fixed “safe” columns, with spacing control
   const safeXs = [
     130,
     WORLD_W - 130 - ladderW,
@@ -378,8 +464,8 @@ function buildLevelLayout(seed){
     Math.floor(WORLD_W * 0.78),
   ];
 
-  const MIN_LADDER_X_GAP = 220; // prevents consecutive ladders being “together”
-  const MIN_REPEAT_GAP   = 140; // avoids repeating same-ish column too often
+  const MIN_LADDER_X_GAP = 220;
+  const MIN_REPEAT_GAP   = 140;
 
   let prevX = null;
   let prevPrevX = null;
@@ -425,111 +511,59 @@ function buildLevelLayout(seed){
 }
 
 // ----------------------------------------------------
-// ENTITIES
-// ----------------------------------------------------
-function resetRun(){
-  money = START_MONEY;
-  bestPlatformReached = 0;
-
-  const base = platforms[0];
-  const top  = platforms[platforms.length-1];
-
-  player = {
-    x: WORLD_W*0.18,
-    footY: base.floorY,
-    w:60, h:90,
-    vx:0, vy:0,
-    speed:340,
-    gravity:1600,
-    onGround:true,
-    onLadder:false,
-    ladderId:-1,
-    facing:1,
-    anim:"idle",
-  };
-
-  villain = {
-    x: WORLD_W*0.38,
-    footY: top.floorY,
-    w:120, h:150,
-    throwing:false,
-    throwPoseT:0,
-    goodFlashT:0,
-    lastThrowWasGood:false,
-  };
-
-  // princess: near top ladder BUT away from villain
-  const topLadder = ladders[ladders.length - 1];
-
-  const MIN_VILLAIN_DIST = 260;
-  const leftPos  = clamp(topLadder.x - 44, 120, WORLD_W - 140);
-  const rightPos = clamp(topLadder.x + topLadder.w + 44, 120, WORLD_W - 140);
-
-  let princessX = (Math.abs(rightPos - villain.x) >= Math.abs(leftPos - villain.x)) ? rightPos : leftPos;
-  if (Math.abs(princessX - villain.x) < MIN_VILLAIN_DIST){
-    princessX = (princessX === rightPos) ? leftPos : rightPos;
-  }
-
-  princess = {
-    x: princessX,
-    footY: top.floorY,
-    w:80, h:120,
-  };
-
-  projectiles = [];
-  villainThrowTimer = 0;
-  lastMs = millis();
-
-  submittedThisRun = false;
-  pendingSubmit = false;
-  closeNameOverlay();
-
-  stopMusic("Victory"); stopMusic("Defeat"); endMusicNow = null;
-}
-
-// ----------------------------------------------------
-// DIFFICULTY
+// DIFFICULTY (platform progress + LEVEL boost)
 // ----------------------------------------------------
 function difficultyLevel(){
   return clamp(bestPlatformReached, 0, platforms.length - 1);
 }
 
-function throwIntervalMs(){
+// Total difficulty used for speeds/intervals.
+// Level boosts difficulty without breaking your “per ladder” feel.
+function totalDifficulty(){
   const d = difficultyLevel();
-  return clamp(1250 - d*140, 500, 1000);
+  const levelBoost = (level - 1) * 2; // L1 +0, L2 +2, L3 +4
+  return clamp(d + levelBoost, 0, 12);
+}
+
+function throwIntervalMs(){
+  const td = totalDifficulty();
+  return clamp(1250 - td*120, 420, 1000);
 }
 
 function barrelRollSpeed(){
-  const d = difficultyLevel();
-  return 260 + d*32;
+  const td = totalDifficulty();
+  return 255 + td*28;
 }
 
 function fallSpeed(){
-  const d = difficultyLevel();
-  return 630 + d*40;
+  const td = totalDifficulty();
+  return 620 + td*34;
 }
 
-function plannedMinRollDist(d){
-  const base = 270;
-  const dec  = d * 14;
-  return clamp(base - dec + random(-70, 110), 160, 380);
+function plannedMinRollDist(td){
+  const base = 280;
+  const dec  = td * 12;
+  return clamp(base - dec + random(-70, 110), 150, 380);
 }
 
 function projectileRightProbability(){
-  const d = difficultyLevel();
-  let pRight = 0.78;
-  if (d === 1) pRight = 0.72;
-  if (d === 2) pRight = 0.66;
-  if (d === 3) pRight = 0.60;
-  if (d >= 4)  pRight = 0.56;
+  const td = totalDifficulty();
+
+  // Still biased right, but as difficulty increases it becomes less predictable
+  let pRight = 0.80;          // easy
+  if (td >= 2) pRight = 0.74;
+  if (td >= 4) pRight = 0.66;
+  if (td >= 6) pRight = 0.60;
+  if (td >= 8) pRight = 0.56;
+
   pRight += random(-0.07, 0.07);
-  return clamp(pRight, 0.52, 0.86);
+  return clamp(pRight, 0.52, 0.88);
 }
 
 function pickProjectileType(){
-  const d = difficultyLevel();
-  const coinChance = clamp(0.30 - d*0.07, 0.06, 0.30);
-  const bombChance = clamp(0.34 + d*0.06, 0.34, 0.70);
+  const td = totalDifficulty();
+  const coinChance = clamp(0.30 - td*0.05, 0.05, 0.30); // coins drop off quickly
+  const bombChance = clamp(0.34 + td*0.05, 0.34, 0.75);
   const r = random();
   if (r < coinChance) return "coin";
   if (r < coinChance + bombChance) return "bomb";
@@ -543,7 +577,7 @@ function projectileImage(type){
 }
 
 function assignDropPlan(p){
-  const d = difficultyLevel();
+  const td = totalDifficulty();
 
   // edge-friendly distribution
   const r = random();
@@ -553,7 +587,7 @@ function assignDropPlan(p){
   else dropX = random(WORLD_W - 260, WORLD_W - 80);
 
   p.dropX = dropX;
-  p.minRollDist = plannedMinRollDist(d);
+  p.minRollDist = plannedMinRollDist(td);
   p.rollDist = 0;
   p.canDrop = false;
 }
@@ -827,7 +861,7 @@ function updateVillain(dt){
 }
 
 // ----------------------------------------------------
-// WIN/LOSE
+// WIN/LOSE + LEVEL PROGRESSION
 // ----------------------------------------------------
 function updateWinLose(){
   if (gameState !== STATE.PLAY) return;
@@ -836,7 +870,16 @@ function updateWinLose(){
   const rr = rectFromEntity(princess);
 
   if (aabb(pr.x, pr.y, pr.w, pr.h, rr.x, rr.y, rr.w, rr.h)){
-    endGame(true);
+    // Level cleared!
+    if (level < MAX_LEVELS){
+      gameState = STATE.LEVEL_CLEAR;
+      // stop pressure
+      projectiles = [];
+      villainThrowTimer = 0;
+      playSFX("Button");
+    } else {
+      endGame(true);
+    }
   }
 }
 
@@ -869,7 +912,7 @@ function draw(){
 
   if (audioReady){
     if (gameState === STATE.START) playMusic("MAIN_MENU");
-    else if (gameState === STATE.PLAY) playMusic("GameLoop");
+    else if (gameState === STATE.PLAY || gameState === STATE.LEVEL_CLEAR) playMusic("GameLoop");
   }
 
   if (gameState === STATE.PLAY){
@@ -908,6 +951,9 @@ function renderWorld(){
     drawLevel();
     drawHUD();
 
+    if (gameState === STATE.LEVEL_CLEAR){
+      drawLevelClearOverlay();
+    }
     if (gameState === STATE.WIN){
       drawEndScreen(true);
       drawLeaderboardPanel();
@@ -1047,7 +1093,7 @@ function drawEntitySprite(im, xLeft, footY, spriteW, spriteH, footOffsetY){
 }
 
 // ----------------------------------------------------
-// HUD (money only)
+// HUD (money + level)
 // ----------------------------------------------------
 function drawHUD(){
   fill(0,140);
@@ -1061,6 +1107,36 @@ function drawHUD(){
 
   fill(money <= HIT_BARREL ? color(255,90,90) : color(140,255,170));
   text(`${money.toLocaleString("en-US")} FT`, 155, 35);
+
+  fill(255);
+  textAlign(RIGHT, CENTER);
+  textSize(22);
+  text(`LEVEL ${level}/${MAX_LEVELS}`, WORLD_W - 40, 35);
+}
+
+// ----------------------------------------------------
+// LEVEL CLEAR OVERLAY
+// ----------------------------------------------------
+function drawLevelClearOverlay(){
+  fill(0,210);
+  rect(0,0,WORLD_W,WORLD_H);
+
+  const cardW = LEVEL_CLEAR_UI.cardW;
+  const cardH = LEVEL_CLEAR_UI.cardH;
+  const x = (WORLD_W - cardW)/2;
+  const y = (WORLD_H - cardH)/2;
+
+  fill(0,230);
+  rect(x,y,cardW,cardH,22);
+
+  fill(255);
+  textAlign(CENTER, CENTER);
+  textSize(LEVEL_CLEAR_UI.titleSize);
+  text(`LEVEL ${level} CLEARED`, WORLD_W/2, y + 110);
+
+  fill(255,220,0);
+  textSize(LEVEL_CLEAR_UI.bodySize);
+  text("CLICK TO CONTINUE", WORLD_W/2, y + 210);
 }
 
 // ----------------------------------------------------
@@ -1217,9 +1293,15 @@ function mousePressed(){
     return;
   }
 
+  if (gameState === STATE.LEVEL_CLEAR){
+    // advance to next level
+    level = clamp(level + 1, 1, MAX_LEVELS);
+    startLevel(level, Date.now());
+    gameState = STATE.PLAY;
+    return;
+  }
+
   if (gameState === STATE.WIN || gameState === STATE.LOSE){
-    // new layout seed each run (keeps ladders varied but never “double”)
-    buildLevelLayout(Date.now());
     resetRun();
     gameState = STATE.START;
     playSFX("Button");
@@ -1232,7 +1314,6 @@ function keyPressed(){
   if (isOverlayOpen()) return;
 
   if ((gameState === STATE.WIN || gameState === STATE.LOSE) && (key === "r" || key === "R")){
-    buildLevelLayout(Date.now());
     resetRun();
     gameState = STATE.START;
     playSFX("Button");
@@ -1269,7 +1350,7 @@ function screenToWorld(sx, sy){
 }
 
 // ----------------------------------------------------
-// NAME OVERLAY (WIN only)
+// NAME OVERLAY (WIN only — only on final level)
 // ----------------------------------------------------
 function initNameOverlay(){
   nameOverlay = createDiv("");
