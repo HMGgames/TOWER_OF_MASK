@@ -1,11 +1,17 @@
 /*  TOWER OF MASKS — Donkey-style Vertical (p5.js)
     WORLD 1080x1920, fit-to-screen (no stretch)
 
-    ✅ 3 LEVELS: you must clear 3 princesses to reach leaderboard
+    ✅ 3 LEVELS: you must clear 3 princesses to reach "final win"
     ✅ Money accumulates across levels (no reset between level 1/2/3)
     ✅ Each level regenerates ladders layout randomly (but never "two ladders together")
     ✅ Difficulty increases by ladder progress AND by level
     ✅ Start button: HUGE hitbox box, image drawn FIT (NO stretch, NO shadow)
+
+    ✅ NEW: Leaderboard ALSO on LOSE with NEGATIVE money (debt)
+    ✅ NEW: Money can go negative on death (we keep exact debt amount)
+    ✅ NEW: Lucky Save:
+        - random chance on any level
+        - guaranteed for everyone on Level 3 (once)
 */
 
 const ASSET_DIR = "assets/";
@@ -44,7 +50,17 @@ const HIT_BARREL = 97000;
 const HIT_BOMB   = 193000;
 const GAIN_COIN  = 129000;
 
+let debtFT = 0; // shows on LOSE if money < 0
+
 let bestPlatformReached = 0;
+
+// Lucky save (random + guaranteed L3 once)
+const LUCK_SAVE = {
+  baseChance: 0.22,   // 22%
+  levelPenalty: 0.05, // -5% per level (L2, L3) for the RANDOM save
+  minMoneyGate: 1,    // only if you were alive before hit
+};
+let usedGuaranteedL3Save = false;
 
 // Tutorial
 let tutorialSeenThisSession = false;
@@ -361,7 +377,10 @@ function loadVolumePrefs(){
 // ----------------------------------------------------
 function resetRun(){
   money = START_MONEY;
+  debtFT = 0;
   level = 1;
+  usedGuaranteedL3Save = false;
+
   submittedThisRun = false;
   pendingSubmit = false;
   closeNameOverlay();
@@ -376,6 +395,9 @@ function resetRun(){
 function startLevel(lv, seed){
   level = clamp(lv, 1, MAX_LEVELS);
   levelSeed = seed || Date.now();
+
+  // Level 3: reset the guaranteed save usage for this level only
+  if (level === 3) usedGuaranteedL3Save = false;
 
   buildLevelLayout(levelSeed);
 
@@ -414,7 +436,7 @@ function startLevel(lv, seed){
   // princess: near top ladder BUT away from villain
   const topLadder = ladders[ladders.length - 1];
 
-  const MIN_VILLAIN_DIST = 300; // slightly stronger separation
+  const MIN_VILLAIN_DIST = 300;
   const leftPos  = clamp(topLadder.x - 44, 120, WORLD_W - 140);
   const rightPos = clamp(topLadder.x + topLadder.w + 44, 120, WORLD_W - 140);
 
@@ -517,8 +539,6 @@ function difficultyLevel(){
   return clamp(bestPlatformReached, 0, platforms.length - 1);
 }
 
-// Total difficulty used for speeds/intervals.
-// Level boosts difficulty without breaking your “per ladder” feel.
 function totalDifficulty(){
   const d = difficultyLevel();
   const levelBoost = (level - 1) * 2; // L1 +0, L2 +2, L3 +4
@@ -549,8 +569,7 @@ function plannedMinRollDist(td){
 function projectileRightProbability(){
   const td = totalDifficulty();
 
-  // Still biased right, but as difficulty increases it becomes less predictable
-  let pRight = 0.80;          // easy
+  let pRight = 0.80;
   if (td >= 2) pRight = 0.74;
   if (td >= 4) pRight = 0.66;
   if (td >= 6) pRight = 0.60;
@@ -562,7 +581,7 @@ function projectileRightProbability(){
 
 function pickProjectileType(){
   const td = totalDifficulty();
-  const coinChance = clamp(0.30 - td*0.05, 0.05, 0.30); // coins drop off quickly
+  const coinChance = clamp(0.30 - td*0.05, 0.05, 0.30);
   const bombChance = clamp(0.34 + td*0.05, 0.34, 0.75);
   const r = random();
   if (r < coinChance) return "coin";
@@ -579,7 +598,6 @@ function projectileImage(type){
 function assignDropPlan(p){
   const td = totalDifficulty();
 
-  // edge-friendly distribution
   const r = random();
   let dropX;
   if (r < 0.40) dropX = random(80, WORLD_W - 80);
@@ -715,15 +733,53 @@ function updateProjectiles(dt){
   projectiles = projectiles.filter(p => p.alive);
 }
 
-function applyProjectileHit(p){
-  if (p.type === "barrel"){ money -= HIT_BARREL; playSFX("Barrel"); }
-  if (p.type === "bomb")  { money -= HIT_BOMB;   playSFX("Bomb"); }
-  if (p.type === "coin")  { money += GAIN_COIN;  playSFX("Coin"); }
+// ----- Lucky Save helpers -----
+function luckySaveChanceRandom(){
+  let p = LUCK_SAVE.baseChance - (level - 1) * LUCK_SAVE.levelPenalty;
+  return clamp(p, 0.06, 0.30);
+}
 
-  if (money <= 0){
-    money = 0;
-    endGame(false);
+// ----------------------------------------------------
+// DAMAGE / MONEY / DEBT + LUCKY SAVE
+// ----------------------------------------------------
+function applyProjectileHit(p){
+  let delta = 0;
+  if (p.type === "barrel"){ delta = -HIT_BARREL; playSFX("Barrel"); }
+  if (p.type === "bomb")  { delta = -HIT_BOMB;   playSFX("Bomb"); }
+  if (p.type === "coin")  { delta = +GAIN_COIN;  playSFX("Coin"); }
+
+  const before = money;
+  const after = before + delta;
+
+  // coins or hits that don't kill
+  if (after > 0){
+    money = after;
+    debtFT = 0;
+    return;
   }
+
+  // would die (after <= 0)
+  const eligible = (before >= LUCK_SAVE.minMoneyGate);
+
+  // ✅ GUARANTEED: if you're on level 3 and haven't used it yet
+  if (eligible && level === 3 && !usedGuaranteedL3Save){
+    usedGuaranteedL3Save = true;
+    money = 1;
+    debtFT = 0;
+    return;
+  }
+
+  // ✅ RANDOM: any level (including level 3 after guaranteed is used)
+  if (eligible && random() < luckySaveChanceRandom()){
+    money = 1;
+    debtFT = 0;
+    return;
+  }
+
+  // DIE: keep negative debt (do NOT clamp to 0)
+  money = after;                 // can be negative
+  debtFT = Math.max(0, -money);
+  endGame(false);
 }
 
 // ----------------------------------------------------
@@ -870,10 +926,8 @@ function updateWinLose(){
   const rr = rectFromEntity(princess);
 
   if (aabb(pr.x, pr.y, pr.w, pr.h, rr.x, rr.y, rr.w, rr.h)){
-    // Level cleared!
     if (level < MAX_LEVELS){
       gameState = STATE.LEVEL_CLEAR;
-      // stop pressure
       projectiles = [];
       villainThrowTimer = 0;
       playSFX("Button");
@@ -893,11 +947,14 @@ function endGame(isWin){
   if (isWin){
     playSFX("Game_over_win");
     playEndMusic("Victory");
-    if (!submittedThisRun) openNameOverlay();
   } else {
     playSFX("Game_over_loose");
     playEndMusic("Defeat");
+    debtFT = Math.max(0, -money);
   }
+
+  // ✅ Leaderboard + name entry ALSO on LOSE (negative is allowed)
+  if (!submittedThisRun) openNameOverlay();
 
   fetchGlobalTop10JSONP(true);
 }
@@ -1105,7 +1162,8 @@ function drawHUD(){
   textSize(24);
   text("MONEY:", 40, 35);
 
-  fill(money <= HIT_BARREL ? color(255,90,90) : color(140,255,170));
+  const moneyIsBad = (money <= HIT_BARREL);
+  fill(money < 0 ? color(255,90,90) : (moneyIsBad ? color(255,140,120) : color(140,255,170)));
   text(`${money.toLocaleString("en-US")} FT`, 155, 35);
 
   fill(255);
@@ -1158,6 +1216,13 @@ function drawEndScreen(isWin){
   text(`FINAL MONEY: ${money.toLocaleString("en-US")} FT`, WORLD_W/2, WORLD_H*0.25);
 
   if (!isWin){
+    const d = Math.max(0, -money);
+    if (d > 0){
+      fill(255,90,90);
+      textSize(26);
+      text(`DEBT: ${d.toLocaleString("en-US")} FT`, WORLD_W/2, WORLD_H*0.29);
+    }
+
     textSize(22);
     fill(255,220,0);
     text("TAP TO RESTART", WORLD_W/2, WORLD_H*0.32);
@@ -1294,7 +1359,6 @@ function mousePressed(){
   }
 
   if (gameState === STATE.LEVEL_CLEAR){
-    // advance to next level
     level = clamp(level + 1, 1, MAX_LEVELS);
     startLevel(level, Date.now());
     gameState = STATE.PLAY;
@@ -1350,7 +1414,7 @@ function screenToWorld(sx, sy){
 }
 
 // ----------------------------------------------------
-// NAME OVERLAY (WIN only — only on final level)
+// NAME OVERLAY (now used on WIN and LOSE)
 // ----------------------------------------------------
 function initNameOverlay(){
   nameOverlay = createDiv("");
@@ -1383,7 +1447,7 @@ function initNameOverlay(){
   title.style("font-size","18px");
   title.style("margin-bottom","10px");
 
-  const sub = createDiv("Your score is your FINAL MONEY.");
+  const sub = createDiv("Your score is your FINAL MONEY (can be negative).");
   sub.parent(nameCard);
   sub.style("opacity","0.85");
   sub.style("font-size","14px");
