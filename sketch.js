@@ -1,12 +1,13 @@
 /*  TOWER OF MASKS — Donkey-style Vertical (p5.js)
     WORLD 1080x1920, fit-to-screen (no stretch)
 
-    Fixes in this final:
-    ✅ Start button: NO black shadow plate, NO stretching; keeps PNG aspect ratio
-    ✅ Projectiles: true random drop positions across platform:
-       - each projectile has minRollDist + target dropX per platform segment
-       - allows reaching extremes; not always dropping mid
-       - still Donkey logic: ROLL -> FALL at ends + random drop -> pass-through while falling -> land on next platform
+    FINAL (3-level mode):
+    ✅ 3 Levels: touching princess advances to next level (new ladder layout)
+    ✅ Money accumulates across levels (score = FINAL MONEY after level 3)
+    ✅ Leaderboard + name entry ONLY after beating level 3
+    ✅ If you lose on any level: TAP TO RESTART (no name form)
+    ✅ Projectiles keep Donkey logic + planned random drops across width (incl. edges)
+    ✅ Start button preserves aspect ratio (no stretch) + big hitbox (no black plate)
 */
 
 const ASSET_DIR = "assets/";
@@ -18,6 +19,13 @@ const WORLD_H = 1920;
 
 const STATE = { START:"START", PLAY:"PLAY", WIN:"WIN", LOSE:"LOSE" };
 let gameState = STATE.START;
+
+// ---------- LEVELS ----------
+const MAX_LEVELS = 3;
+let level = 1;             // 1..MAX_LEVELS
+const LEVEL_SEED_BASE = 1337;
+// difficulty boost per level (subtle)
+const LEVEL_DIFFICULTY_BONUS = { 1:0, 2:1, 3:2 };
 
 // Assets
 let img = {};
@@ -99,11 +107,12 @@ const LADDER_OVERLAP_BOTTOM = 16;
 // Platform visual offset (base only)
 const PLATFORM_DRAW_OFFSET_Y = { base:55, mid:0, top:0 };
 
-// Start button: huge box, but image is drawn FIT (NO stretch, NO shadow)
+// Start button: big hitbox, but image is drawn FIT (NO stretch, NO shadow)
 const START_BTN = {
-  bw: 1940,
-  bh: 1260,
+  bw: 980,      // hitbox box (keep sane; image will be fit inside)
+  bh: 260,
   byPct: 0.44,
+  scale: 2.0,   // HERO scale for the image inside the box (no stretch)
 };
 
 // Tutorial UI
@@ -152,7 +161,7 @@ function preload(){
   img.projBomb   = loadImage(assetPath("proj_bomb.png"));
   img.projCoin   = loadImage(assetPath("proj_coin.png"));
 
-  // Sounds
+  // Sounds (.wav)
   snd.MAIN_MENU       = loadSound(assetPath("MAIN_MENU.wav"));
   snd.GameLoop        = loadSound(assetPath("GameLoop.wav"));
   snd.Victory         = loadSound(assetPath("Victory.wav"));
@@ -181,7 +190,9 @@ function setup(){
   initAudioUI();
 
   initNameOverlay();
-  buildLevelLayout();
+
+  // Start level 1 layout + fresh run
+  buildLevelLayout(LEVEL_SEED_BASE + level);
   resetRun();
 
   setTimeout(()=>fetchGlobalTop10JSONP(true), 400);
@@ -345,9 +356,9 @@ function loadVolumePrefs(){
 }
 
 // ----------------------------------------------------
-// LEVEL LAYOUT
+// LEVEL LAYOUT (seeded ladders per level)
 // ----------------------------------------------------
-function buildLevelLayout(){
+function buildLevelLayout(seed){
   platforms = [];
   ladders = [];
 
@@ -364,19 +375,36 @@ function buildLevelLayout(){
     platforms.push({ index:i, kind, dir:dirs[i], floorY, thickness:18 });
   }
 
+  // Seeded ladder positions for this level
+  randomSeed(seed);
+
   const ladderW = 72;
-  const ladderInset = 130;
-  function ladderXFor(i){
-    const pattern = [ ladderInset, WORLD_W - ladderInset - ladderW, WORLD_W*0.35, WORLD_W*0.60 ];
-    return pattern[i % pattern.length];
-  }
+  const safeXs = [
+    130,
+    WORLD_W - 130 - ladderW,
+    Math.floor(WORLD_W * 0.26),
+    Math.floor(WORLD_W * 0.40),
+    Math.floor(WORLD_W * 0.56),
+    Math.floor(WORLD_W * 0.70),
+    Math.floor(WORLD_W * 0.48),
+  ];
+
+  let prevX = null;
 
   for (let i=0;i<platforms.length-1;i++){
     const lower = platforms[i];
     const upper = platforms[i+1];
+
+    // pick from safe pool, avoid repeating same area
+    let x = random(safeXs);
+    if (prevX !== null && Math.abs(x - prevX) < 90){
+      x = random(safeXs);
+    }
+    prevX = x;
+
     ladders.push({
       id:i,
-      x: ladderXFor(i),
+      x,
       w: ladderW,
       yTop: upper.floorY,
       yBottom: lower.floorY,
@@ -388,91 +416,122 @@ function buildLevelLayout(){
 }
 
 // ----------------------------------------------------
-// ENTITIES
+// ENTITIES / RUN CONTROL
 // ----------------------------------------------------
 function resetRun(){
   money = START_MONEY;
+  level = 1;
+  submittedThisRun = false;
+  pendingSubmit = false;
+  closeNameOverlay();
+
+  // stop end music
+  stopMusic("Victory"); stopMusic("Defeat"); endMusicNow = null;
+
+  startLevel(1, true); // fresh run, resets money already done above
+}
+
+function startLevel(newLevel, clearProjectiles){
+  level = clamp(newLevel, 1, MAX_LEVELS);
+
+  // rebuild ladder layout for this level
+  buildLevelLayout(LEVEL_SEED_BASE + level);
+
+  // reset ladder progress per level (difficulty still ramps within the level)
   bestPlatformReached = 0;
 
   const base = platforms[0];
   const top  = platforms[platforms.length-1];
 
-  player = {
-    x: WORLD_W*0.18,
-    footY: base.floorY,
-    w:60, h:90,
-    vx:0, vy:0,
-    speed:340,
-    gravity:1600,
-    onGround:true,
-    onLadder:false,
-    ladderId:-1,
-    facing:1,
-    anim:"idle",
-  };
+  // create or re-position player
+  if (!player){
+    player = {
+      x: WORLD_W*0.18,
+      footY: base.floorY,
+      w:60, h:90,
+      vx:0, vy:0,
+      speed:340,
+      gravity:1600,
+      onGround:true,
+      onLadder:false,
+      ladderId:-1,
+      facing:1,
+      anim:"idle",
+    };
+  } else {
+    player.x = WORLD_W*0.18;
+    player.footY = base.floorY;
+    player.vx = 0; player.vy = 0;
+    player.onGround = true;
+    player.onLadder = false;
+    player.ladderId = -1;
+    player.facing = 1;
+    player.anim = "idle";
+  }
 
-  villain = {
-    x: WORLD_W*0.38,
-    footY: top.floorY,
-    w:120, h:150,
-    throwing:false,
-    throwPoseT:0,
-    goodFlashT:0,
-    lastThrowWasGood:false,
-  };
+  // villain: slightly more left, with tiny per-level variance
+  const jitter = (level === 1) ? random(-10, 10) : random(-25, 25);
+  if (!villain){
+    villain = {
+      x: WORLD_W*0.30 + jitter,
+      footY: top.floorY,
+      w:120, h:150,
+      throwing:false,
+      throwPoseT:0,
+      goodFlashT:0,
+      lastThrowWasGood:false,
+    };
+  } else {
+    villain.x = WORLD_W*0.30 + jitter;
+    villain.footY = top.floorY;
+    villain.throwing = false;
+    villain.throwPoseT = 0;
+    villain.goodFlashT = 0;
+    villain.lastThrowWasGood = false;
+  }
 
-  // princess near top ladder (slightly left of ladder + a touch higher via foot offset)
+  // princess: put LEFT of the top ladder, snug + a bit higher via FOOT_OFFSET_Y
   const topLadder = ladders[ladders.length - 1];
-  princess = {
-    x: clamp(topLadder.x + topLadder.w + 34, 120, WORLD_W - 140),
-    footY: top.floorY,
-    w:80, h:120,
-  };
+  const princessX = clamp(topLadder.x - 34, 120, WORLD_W - 140);
 
-  projectiles = [];
+  if (!princess){
+    princess = { x: princessX, footY: top.floorY, w:80, h:120 };
+  } else {
+    princess.x = princessX;
+    princess.footY = top.floorY;
+  }
+
+  // projectiles & timers
+  if (clearProjectiles) projectiles = [];
   villainThrowTimer = 0;
   lastMs = millis();
-
-  submittedThisRun = false;
-  pendingSubmit = false;
-  closeNameOverlay();
-
-  // stop end music if any
-  stopMusic("Victory"); stopMusic("Defeat"); endMusicNow = null;
 }
 
 // ----------------------------------------------------
 // DIFFICULTY
 // ----------------------------------------------------
 function difficultyLevel(){
-  // 0..(platforms-1)
-  return clamp(bestPlatformReached, 0, platforms.length - 1);
+  const ladderProgress = clamp(bestPlatformReached, 0, platforms.length - 1);
+  const bonus = LEVEL_DIFFICULTY_BONUS[level] || 0;
+  return clamp(ladderProgress + bonus, 0, (platforms.length - 1) + 3);
 }
 
 function throwIntervalMs(){
   const d = difficultyLevel();
-  // Más suave al inicio, y recién aprieta fuerte arriba
-  // d:0 -> 1250ms | d:3 -> ~850ms | d:6 -> ~670ms (min 560)
   return clamp(1250 - d*140, 500, 1000);
 }
 
 function barrelRollSpeed(){
   const d = difficultyLevel();
-  // Menos agresivo que 60*d, pero igual escala
-  // d:0 -> 260 | d:3 -> 356 | d:6 -> 452
   return 260 + d*32;
 }
 
 function fallSpeed(){
   const d = difficultyLevel();
-  // Caída más controlable
-  // d:0 -> 630 | d:3 -> 750 | d:6 -> 870
   return 630 + d*40;
 }
 
 function plannedMinRollDist(d){
-  // Que rueden un rato (jugable) y recién después se vuelva más caótico
-  // d:0 -> ~260 (con jitter) | d:6 -> ~188 (con jitter)
   const base = 270;
   const dec  = d * 14;
   return clamp(base - dec + random(-70, 110), 160, 380);
@@ -481,26 +540,21 @@ function plannedMinRollDist(d){
 function projectileRightProbability(){
   const d = difficultyLevel();
 
-  // Sesgo más a la derecha en general.
-  // Se acerca a ~55/45 recién arriba, nunca 50/50 exacto.
-  let pRight = 0.78;        // d=0
+  let pRight = 0.78;
   if (d === 1) pRight = 0.72;
   if (d === 2) pRight = 0.66;
   if (d === 3) pRight = 0.60;
   if (d >= 4)  pRight = 0.56;
 
-  // Jitter para que se sienta orgánico, no esquemático
   pRight += random(-0.07, 0.07);
-
-  // Clamp para mantener sesgo a derecha siempre
   return clamp(pRight, 0.52, 0.86);
 }
 
-// Type weights: coins drop fast after you climb
+// Type weights: coins drop fast after you climb + after level bonus
 function pickProjectileType(){
   const d = difficultyLevel();
-  const coinChance = clamp(0.30 - d*0.07, 0.06, 0.30);
-  const bombChance = clamp(0.34 + d*0.06, 0.34, 0.70);
+  const coinChance = clamp(0.30 - d*0.07, 0.05, 0.30);
+  const bombChance = clamp(0.34 + d*0.06, 0.34, 0.75);
   const r = random();
   if (r < coinChance) return "coin";
   if (r < coinChance + bombChance) return "bomb";
@@ -513,14 +567,10 @@ function projectileImage(type){
   return img.projCoin;
 }
 
-// Create a new “drop plan” for the projectile on its current platform:
-// - choose a random dropX across width (biased to include edges)
-// - choose minRollDist before it can drop
 function assignDropPlan(p){
   const d = difficultyLevel();
 
-  // pick dropX with edge-friendly distribution:
-  // 40% anywhere, 30% near left edge, 30% near right edge
+  // edge-friendly distribution
   const r = random();
   let dropX;
   if (r < 0.40) dropX = random(80, WORLD_W - 80);
@@ -534,7 +584,7 @@ function assignDropPlan(p){
 }
 
 // ----------------------------------------------------
-// PROJECTILES (Donkey path, but better random drop)
+// PROJECTILES (Donkey path, better random drop)
 // ----------------------------------------------------
 function spawnProjectile(){
   const topIndex = platforms.length - 1;
@@ -565,7 +615,6 @@ function spawnProjectile(){
     fallV: fallSpeed(),
     alive: true,
 
-    // planned random drop
     dropX: 0,
     minRollDist: 0,
     rollDist: 0,
@@ -594,24 +643,18 @@ function updateProjectiles(dt){
     if (p.state === "ROLL"){
       const plat = platforms[p.platformIndex];
 
-      // Keep chosen direction only on top platform initial segment; otherwise use platform dir
       if (!(p.platformIndex === topIndex && p.topDirOverride)) p.dir = plat.dir;
 
       const prevX = p.x;
       p.x += p.dir * p.rollSpeed * dt;
       p.y = plat.floorY - p.h;
 
-      // track roll distance on this platform segment
       p.rollDist += Math.abs(p.x - prevX);
-
-      // eligible to drop only after minimum roll
       if (!p.canDrop && p.rollDist >= p.minRollDist) p.canDrop = true;
 
       const atLeft = (p.x <= -10);
       const atRight = (p.x + p.w >= WORLD_W + 10);
 
-      // Planned drop trigger:
-      // if rolling right and passes dropX, or rolling left and passes dropX
       let wantsPlannedDrop = false;
       const cx = p.x + p.w*0.5;
       if (p.canDrop){
@@ -619,22 +662,18 @@ function updateProjectiles(dt){
         if (p.dir === -1 && cx <= p.dropX) wantsPlannedDrop = true;
       }
 
-      // small extra “surprise” chance after eligible, so it doesn't feel deterministic
-      // (but still not per-frame spam because it's only after min roll)
+      // gentle surprise (only after eligible)
       const surprise = p.canDrop && (random() < 0.012);
 
       if (atLeft || atRight || wantsPlannedDrop || surprise){
         p.state = "FALL";
         p.topDirOverride = false;
-
-        // keep x inside world so fall is visible
         p.x = clamp(p.x, 10, WORLD_W - p.w - 10);
       }
     }
     else if (p.state === "FALL"){
       p.y += p.fallV * dt;
 
-      // find landing platform below (smallest floorY >= proj bottom)
       const projBottom = p.y + p.h;
       let landingIndex = -1;
       let landingY = Infinity;
@@ -650,12 +689,9 @@ function updateProjectiles(dt){
       }
 
       if (landingIndex !== -1 && projBottom >= landingY - 2){
-        // Land
         p.platformIndex = landingIndex;
         p.state = "ROLL";
         p.y = platforms[landingIndex].floorY - p.h;
-
-        // NEW planned drop for the new platform segment
         assignDropPlan(p);
       }
 
@@ -821,7 +857,7 @@ function updateVillain(dt){
 }
 
 // ----------------------------------------------------
-// WIN/LOSE
+// WIN/LOSE (3 levels)
 // ----------------------------------------------------
 function updateWinLose(){
   if (gameState !== STATE.PLAY) return;
@@ -830,7 +866,14 @@ function updateWinLose(){
   const rr = rectFromEntity(princess);
 
   if (aabb(pr.x, pr.y, pr.w, pr.h, rr.x, rr.y, rr.w, rr.h)){
-    endGame(true);
+    // Advance levels until final win
+    if (level < MAX_LEVELS){
+      // small reset pressure, keep money
+      startLevel(level + 1, true);
+      // keep playing (no win screen)
+      return;
+    }
+    endGame(true); // only now show win screen + leaderboard
   }
 }
 
@@ -844,7 +887,7 @@ function endGame(isWin){
   if (isWin){
     playSFX("Game_over_win");
     playEndMusic("Victory");
-    if (!submittedThisRun) openNameOverlay();
+    if (!submittedThisRun) openNameOverlay(); // FINAL ONLY
   } else {
     playSFX("Game_over_loose");
     playEndMusic("Defeat");
@@ -893,7 +936,6 @@ function renderWorld(){
   scale(s);
 
   if (fontUI) textFont(fontUI);
-
   if (img.bg) image(img.bg, 0, 0, WORLD_W, WORLD_H);
 
   if (gameState === STATE.START){
@@ -915,7 +957,7 @@ function renderWorld(){
 }
 
 // ----------------------------------------------------
-// START SCREEN (NO shadow, NO stretch)
+// START SCREEN (NO shadow, NO stretch, HERO)
 // ----------------------------------------------------
 function drawStart(){
   if (img.startScreen) image(img.startScreen, 0, 0, WORLD_W, WORLD_H);
@@ -925,15 +967,22 @@ function drawStart(){
   const bx = (WORLD_W - bw)/2;
   const by = WORLD_H * START_BTN.byPct;
 
-  // Draw the button PNG inside bw/bh, preserving aspect ratio (NO stretch)
+  // button image inside the box with extra scale (still no stretch)
   if (img.btnStart){
     const ar = img.btnStart.width / img.btnStart.height;
     let w = bw, h = bh;
     if (w / h > ar) w = h * ar;
     else h = w / ar;
 
-    const x = bx + (bw - w)/2;
-    const y = by + (bh - h)/2;
+    // hero scale (preserve aspect)
+    w *= START_BTN.scale;
+    h *= START_BTN.scale;
+
+    // center on the box center
+    const cx = bx + bw/2;
+    const cy = by + bh/2;
+    const x = cx - w/2;
+    const y = cy - h/2;
 
     image(img.btnStart, x, y, w, h);
   } else {
@@ -959,6 +1008,7 @@ function drawStart(){
 // LEVEL DRAW
 // ----------------------------------------------------
 function drawLevel(){
+  // ladders first, then platforms (platforms draw over ladders)
   for (const L of ladders) drawLadder(L);
   for (const plat of platforms) drawPlatform(plat);
 
@@ -1042,7 +1092,7 @@ function drawEntitySprite(im, xLeft, footY, spriteW, spriteH, footOffsetY){
 }
 
 // ----------------------------------------------------
-// HUD (money only)
+// HUD (money + level)
 // ----------------------------------------------------
 function drawHUD(){
   fill(0,140);
@@ -1056,6 +1106,11 @@ function drawHUD(){
 
   fill(money <= HIT_BARREL ? color(255,90,90) : color(140,255,170));
   text(`${money.toLocaleString("en-US")} FT`, 155, 35);
+
+  fill(255);
+  textAlign(RIGHT, CENTER);
+  textSize(22);
+  text(`LEVEL ${level}/${MAX_LEVELS}`, WORLD_W - 40, 35);
 }
 
 // ----------------------------------------------------
@@ -1192,14 +1247,18 @@ function mousePressed(){
   const w = screenToWorld(mouseX, mouseY);
 
   if (gameState === STATE.START){
-    // start button hitbox is the big box (bw/bh), not the image bounds
     const bw = START_BTN.bw, bh = START_BTN.bh;
     const bx = (WORLD_W - bw)/2;
     const by = WORLD_H * START_BTN.byPct;
 
     if (w.x>=bx && w.x<=bx+bw && w.y>=by && w.y<=by+bh){
       playSFX("Button");
+      // Fresh run on start
+      money = START_MONEY;
+      submittedThisRun = false;
+      startLevel(1, true);
       gameState = STATE.PLAY;
+
       if (!tutorialSeenThisSession) showTutorialOverlay = true;
     }
     return;
@@ -1262,7 +1321,7 @@ function screenToWorld(sx, sy){
 }
 
 // ----------------------------------------------------
-// NAME OVERLAY (WIN only)
+// NAME OVERLAY (WIN only, final level)
 // ----------------------------------------------------
 function initNameOverlay(){
   nameOverlay = createDiv("");
