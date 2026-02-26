@@ -85,6 +85,8 @@ let audioUI, audioUIVisible = false;
 let musicNow = null;
 let endMusicNow = null;
 
+let touchInput = { left:false, right:false, up:false, down:false, active:false };
+
 const VOL_DEFAULTS = {
   master: 1.0,
   music: 0.85,
@@ -200,10 +202,12 @@ function preload(){
 // SETUP
 // ----------------------------------------------------
 function setup(){
-  createCanvas(windowWidth, windowHeight);
+  const c = createCanvas(windowWidth, windowHeight);
   pixelDensity(1);
   noSmooth();
   if (fontUI) textFont(fontUI);
+
+  c.elt.style.touchAction = "none";
 
   loadVolumePrefs();
   initAudioUI();
@@ -388,6 +392,8 @@ function resetRun(){
   stopMusic("Victory"); stopMusic("Defeat");
   endMusicNow = null;
 
+  clearTouchInput();
+
   startLevel(level, Date.now());
 }
 
@@ -403,6 +409,7 @@ function startLevel(lv, seed){
 
   bestPlatformReached = 0;
   projectiles = [];
+  clearTouchInput();
   villainThrowTimer = 0;
   lastMs = millis();
 
@@ -786,10 +793,15 @@ function applyProjectileHit(p){
 // PLAYER + LADDER
 // ----------------------------------------------------
 function updatePlayer(dt){
-  const left  = keyIsDown(LEFT_ARROW) || keyIsDown(65);
-  const right = keyIsDown(RIGHT_ARROW) || keyIsDown(68);
-  const up    = keyIsDown(UP_ARROW) || keyIsDown(87);
-  const down  = keyIsDown(DOWN_ARROW) || keyIsDown(83);
+  const keyboardLeft  = keyIsDown(LEFT_ARROW) || keyIsDown(65);
+  const keyboardRight = keyIsDown(RIGHT_ARROW) || keyIsDown(68);
+  const keyboardUp    = keyIsDown(UP_ARROW) || keyIsDown(87);
+  const keyboardDown  = keyIsDown(DOWN_ARROW) || keyIsDown(83);
+
+  const left  = keyboardLeft  || touchInput.left;
+  const right = keyboardRight || touchInput.right;
+  const up    = keyboardUp    || touchInput.up;
+  const down  = keyboardDown  || touchInput.down;
 
   const nearLadder = getNearestLadder(player);
 
@@ -1331,6 +1343,48 @@ function isOverlayOpen(){
   return nameOverlay && nameOverlay.elt && nameOverlay.elt.style.display !== "none";
 }
 
+function clearTouchInput(){
+  touchInput.left = false;
+  touchInput.right = false;
+  touchInput.up = false;
+  touchInput.down = false;
+  touchInput.active = false;
+}
+
+function setTouchInputFromScreen(sx, sy){
+  if (gameState !== STATE.PLAY || isOverlayOpen() || showTutorialOverlay || !player){
+    clearTouchInput();
+    return;
+  }
+
+  const target = screenToWorld(sx, sy);
+  const playerCx = player.x + player.w*0.5;
+  const playerCy = player.footY - player.h*0.5;
+
+  const vx = target.x - playerCx;
+  const vy = target.y - playerCy;
+  const absX = Math.abs(vx);
+  const absY = Math.abs(vy);
+
+  clearTouchInput();
+  touchInput.active = true;
+
+  const deadZone = 22;
+  if (Math.hypot(vx, vy) < deadZone) return;
+
+  const nearLadder = player.onLadder || !!getNearestLadder(player);
+  const preferVertical = nearLadder && absY >= absX;
+
+  if (preferVertical){
+    if (vy < 0) touchInput.up = true;
+    else touchInput.down = true;
+    return;
+  }
+
+  if (vx < 0) touchInput.left = true;
+  else touchInput.right = true;
+}
+
 function mousePressed(){
   ensureAudioReady();
   if (isOverlayOpen()) return;
@@ -1354,6 +1408,9 @@ function mousePressed(){
     if (showTutorialOverlay){
       showTutorialOverlay = false;
       tutorialSeenThisSession = true;
+      clearTouchInput();
+    } else {
+      setTouchInputFromScreen(mouseX, mouseY);
     }
     return;
   }
@@ -1366,10 +1423,37 @@ function mousePressed(){
   }
 
   if (gameState === STATE.WIN || gameState === STATE.LOSE){
+    clearTouchInput();
     resetRun();
     gameState = STATE.START;
     playSFX("Button");
   }
+}
+
+function mouseDragged(){
+  setTouchInputFromScreen(mouseX, mouseY);
+  return false;
+}
+
+function mouseReleased(){
+  clearTouchInput();
+  return false;
+}
+
+function touchStarted(){
+  ensureAudioReady();
+  if (!isOverlayOpen()) setTouchInputFromScreen(mouseX, mouseY);
+  return false;
+}
+
+function touchMoved(){
+  setTouchInputFromScreen(mouseX, mouseY);
+  return false;
+}
+
+function touchEnded(){
+  clearTouchInput();
+  return false;
 }
 
 function keyPressed(){
